@@ -4,7 +4,7 @@ A lightweight Linux container runtime in C with a long-running supervisor and a 
 
 ## Team Information
 - **Abhay Natesh Bharadwaj** (SRN: PES1UG24AM007)
-- **Abhainav D** (SRN: PES1UG24AM011)
+- **Abhinav D** (SRN: PES1UG24AM011)
 
 ---
 
