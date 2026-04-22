@@ -3,8 +3,8 @@
 A lightweight Linux container runtime in C featuring a long-running supervisor, a kernel-space memory monitor, and a concurrent logging pipeline.
 
 ## Team Information
-- **Member 1**: [Your Name/SRN]
-- **Member 2**: [Your Name/SRN]
+- **Member 1**: Abhay Natesh Bharadwaj PES1UG24AM007
+- **Member 2**: Abhinav D PES1UG24AM011
 
 ---
 
