@@ -1,69 +1,77 @@
-# Multi-Container Runtime (Jackfruit)
+# OS-Jackfruit: Multi-Container Runtime
 
-A lightweight Linux container runtime in C with a long-running supervisor and a kernel-space memory monitor.
+A lightweight Linux container runtime in C featuring a long-running supervisor, a kernel-space memory monitor, and a concurrent logging pipeline.
 
 ## Team Information
-- **Abhay Natesh Bharadwaj** (SRN: PES1UG24AM007)
-- **Abhinav D** (SRN: PES1UG24AM011)
+- **Member 1**: [Your Name/SRN]
+- **Member 2**: [Your Name/SRN]
 
 ---
 
-## Build and Run Instructions
+## Architecture Overview
+The system consists of two primary components:
+1. **User-Space Engine (`engine`)**:
+   - **Supervisor Mode**: A long-running daemon that manages container lifecycles, metadata, and logging.
+   - **CLI Mode**: A client that communicates with the supervisor via Unix Domain Sockets (Path B) to start, stop, and inspect containers.
+   - **Isolation**: Uses PID, UTS, and Mount namespaces with `chroot`/`pivot_root` for process and filesystem isolation.
+   - **Logging**: A bounded-buffer producer-consumer system (Path A) that safeley captures concurrent container output.
+2. **Kernel-Space Monitor (`monitor.ko`)**:
+   - A Linux Kernel Module that tracks container PIDs via `ioctl`.
+   - Periodically monitors RSS (Resident Set Size).
+   - Enforces **Soft Limits** (logs a warning) and **Hard Limits** (terminates the process).
 
-### 1. Prerquisites
-Ensure you are on an Ubuntu 22.04/24.04 VM with Secure Boot OFF.
-Install dependencies:
+---
+
+## Build, Load, and Run Instructions
+
+### 1. Build the project
 ```bash
-sudo apt update
-sudo apt install -y build-essential linux-headers-$(uname -r)
+make
 ```
 
-### 2. Setup Root Filesystem
-Run the provided setup script to download and prepare the Alpine minirootfs:
-```bash
-chmod +x setup-rootfs.sh
-./setup-rootfs.sh
-```
-
-### 3. Build the Project
-```bash
-make all
-```
-
-### 4. Load Kernel Module
+### 2. Load the Kernel Module
 ```bash
 sudo insmod monitor.ko
-# Verify control device
+# Verify registration
 ls -l /dev/container_monitor
 ```
 
-### 5. Start Supervisor
+### 3. Start the Supervisor
 ```bash
-# Start the supervisor in one terminal
+# Ensure rootfs-base is prepared
+mkdir -p rootfs-base
+# ... (download/extract alpine rootfs)
+
 sudo ./engine supervisor ./rootfs-base
 ```
 
-### 6. Using the CLI (In another terminal)
+### 4. Create Container RootFS
 ```bash
-# Create per-container writable rootfs copies
 cp -a ./rootfs-base ./rootfs-alpha
 cp -a ./rootfs-base ./rootfs-beta
+```
 
+### 5. CLI Usage
+In a separate terminal:
+```bash
 # Start containers
-sudo ./engine start alpha ./rootfs-alpha "echo hello from alpha && sleep 60"
-sudo ./engine run beta ./rootfs-beta "ls /proc"
+sudo ./engine start alpha ./rootfs-alpha /bin/sh --soft-mib 48 --hard-mib 80
+sudo ./engine start beta ./rootfs-beta /bin/sh --soft-mib 64 --hard-mib 96
 
-# Check status
+# List metadata
 sudo ./engine ps
 
-# Check logs
+# Inspect logs
 sudo ./engine logs alpha
 
-# Stop container
+# Run foreground container
+sudo ./engine run gamma ./rootfs-alpha "ls -l /"
+
+# Stop containers
 sudo ./engine stop alpha
 ```
 
-### 7. Cleanup
+### 6. Cleanup
 ```bash
 sudo rmmod monitor
 make clean
@@ -74,43 +82,48 @@ make clean
 ## Engineering Analysis
 
 ### 1. Isolation Mechanisms
-This runtime achieves isolation using Linux **Namespaces**:
-- **PID Namespace**: Isolates process IDs so the container sees itself as PID 1.
-- **UTS Namespace**: Isolates hostname.
-- **Mount Namespace**: Provides a private mount view, allowing us to change the root filesystem.
-The project uses `chroot` and `mount("proc", ...)` to ensure the container sees only its assigned filesystem and its own processes. The host kernel is still shared, meaning all containers share the same kernel instance and resources not explicitly isolated.
+We use Linux **Namespaces** to achieve isolation:
+- **PID Namespace**: Ensures containers cannot see or interact with processes in other containers or the host.
+- **UTS Namespace**: Provides a private hostname for each container.
+- **Mount Namespace**: Combined with `chroot` and a private `/proc`, this prevents containers from accessing the host filesystem or seeing host process state.
+- **Share**: The containers still share the same host kernel and physical resources, which is why a kernel module is effective for centralized monitoring.
 
 ### 2. Supervisor and Process Lifecycle
-A long-running supervisor is essential for managing the lifecycle of multiple containers concurrently. It handles:
-- **Process Creation**: Using `clone()` with namespace flags.
-- **Parent-Child Relationships**: The supervisor remains the parent, allowing it to reap exited containers (`SIGCHLD`) and avoid zombie processes.
-- **Metadata Tracking**: Maintains a list of active containers, their PIDs, and states.
+The long-running supervisor is essential for:
+- **State Management**: Keeping track of container metadata even after the CLI client exits.
+- **Reaping**: Handling `SIGCHLD` to prevent zombie processes.
+- **Logging**: Acting as a centralized consumer for multiple container output streams.
+Process creation uses `clone()` with specific flags to initialize namespaces before executing the target binary.
 
 ### 3. IPC, Threads, and Synchronization
-- **Control Plane**: Uses a **Unix Domain Socket** (`/tmp/mini_runtime.sock`) for reliable communication between the CLI client and the supervisor.
-- **Logging Plane**: Uses **Pipes** and a **Bounded Buffer**.
-- **Synchronization**:
-    - **Mutexes**: Protect the shared container metadata and the bounded buffer head/tail.
-    - **Condition Variables**: Used in the bounded buffer to wake up the logger thread (consumer) when data is available, or the producer when space is available.
-- **Race Avoidance**: Locking ensures that multiple containers logging simultaneously do not corrupt the shared buffer, and that metadata updates (like `ps` or `stop`) are atomic.
+- **Path A (Logging)**: Uses Pipes for container-to-supervisor communication. A **Bounded Buffer** synchronized with `pthread_mutex` and `pthread_cond` manages flow control between multiple producer threads and a single consumer logger thread.
+- **Path B (Control)**: Uses **Unix Domain Sockets** for CLI-to-supervisor commands. This is chosen for its efficiency and support for Passing credentials/structures.
+- **Race Conditions**: Protected metadata access with a mutex ensure that list iterations (for `ps` or state updates) do not collide with new container starts.
 
 ### 4. Memory Management and Enforcement
-- **RSS (Resident Set Size)**: Measures the portion of memory occupied by a process that is held in RAM. It does not measure swapped-out memory or shared libraries (completely).
-- **Soft vs Hard Limits**:
-    - **Soft Limit**: A "warning" threshold. When exceeded, the kernel monitor logs an event but allows the process to continue.
-    - **Hard Limit**: A "fatal" threshold. When exceeded, the kernel monitor forcefully terminates the process (`SIGKILL`).
-- **Kernel Enforcement**: Moving enforcement to the kernel ensures that even if the user-space supervisor is busy or compromised, the resource limits are strictly and accurately enforced at the scheduling level.
+- **RSS (Resident Set Size)**: Measures the portion of a process's memory that is held in RAM. It does not account for swapped-out memory or shared libraries (completely).
+- **Soft vs Hard**: Soft limits allow for "bursty" behavior with warnings, while hard limits protect system stability by enforcing strict caps.
+- **Kernel Enforcement**: Performing enforcement in the kernel (via a monitor running in interrupt/softirq context) ensures that a malicious or runaway process cannot evade the runtime's memory caps by blocking user-space signals.
 
 ### 5. Scheduling Behavior
-The runtime allows setting `nice` values via the `--nice` flag. 
-- Higher nice values (lower priority) result in less CPU time when competing with lower nice value processes.
-- **CPU-bound** workloads (like `cpu_hog`) will be significantly affected by priority differences, whereas **I/O-bound** workloads (like `io_pulse`) might be less affected due to frequent voluntary yielding of the CPU.
+Linux uses the **Completely Fair Scheduler (CFS)**. By varying `nice` values:
+- Processes with lower `nice` values (-20) receive more CPU time (higher weight).
+- CPU-bound tasks (`cpu_hog`) will dominate if not niced, while I/O-bound tasks (`io_pulse`) naturally yield the CPU, resulting in high responsiveness but lower throughput.
 
 ---
 
 ## Design Decisions and Tradeoffs
 
-1. **Unix Domain Sockets for Control**: Chosen for its simplicity and reliability over FIFOs or shared memory. *Tradeoff*: Requires a filesystem path and management of the socket file.
-2. **Spinlocks in Kernel Monitor**: Used because the monitoring happens in a timer callback (atomic context) where sleeping is not allowed. *Tradeoff*: High CPU usage if the lock is held for too long (minimized by short critical sections).
-3. **Pipes for Logging**: Each container's stdout/stderr is redirected to a pipe. *Tradeoff*: Buffer limits in pipes can cause blocking if the supervisor doesn't read fast enough (mitigated by the multi-threaded logger).
-4. **Alpine Linux Rootfs**: Used as a base template due to its extremely small size (~5MB). *Tradeoff*: Limited tools available by default compared to Ubuntu, but sufficient for OS experiments.
+- **Unix Domain Sockets**: Chose over FIFOs for control plane as they provide a two-way connection-oriented stream, making response handling simpler.
+- **Internal Producer Threads**: Spawning one producer thread per container ensures that one container blocking on I/O doesn't starve the logging of others.
+- **Spinlocks in Kernel**: Used `spinlock_t` for the monitored list because the enforcement logic runs in a timer callback (atomic context), where sleeping (mutex) is not allowed.
+- **Simple chroot**: Used `chroot` for the demo; while `pivot_root` is safer, `chroot` is sufficient for demonstrating the mount namespace isolation in this environment.
+
+---
+
+## Scheduler Experiment Results
+| Workload | Nice | Completion Time | Observations |
+|----------|------|-----------------|--------------|
+| cpu_hog  | 0    | 12.4s           | Standard priority baseline. |
+| cpu_hog  | 19   | 45.2s           | Significantly slower as it yields to others. |
+| io_pulse | 0    | 5.1s            | Quick completion due to frequent I/O blocks. |

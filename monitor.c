@@ -31,17 +31,18 @@
 #define DEVICE_NAME "container_monitor"
 #define CHECK_INTERVAL_SEC 1
 
-struct monitored_entry {
+struct monitored_node {
     pid_t pid;
-    char container_id[32];
+    char container_id[MONITOR_NAME_LEN];
     unsigned long soft_limit_bytes;
     unsigned long hard_limit_bytes;
-    bool soft_limit_warned;
+    bool soft_warned;
     struct list_head list;
 };
 
+
 static LIST_HEAD(monitored_list);
-static DEFINE_SPINLOCK(monitored_list_lock);
+static DEFINE_SPINLOCK(monitor_lock);
 
 
 /* --- Provided: internal device / timer state --- */
@@ -124,29 +125,33 @@ static void kill_process(const char *container_id,
  * --------------------------------------------------------------- */
 static void timer_callback(struct timer_list *t)
 {
-    struct monitored_entry *entry, *tmp;
-    unsigned long flags;
+    struct monitored_node *node, *tmp;
+    long rss;
 
-    spin_lock_irqsave(&monitored_list_lock, flags);
-    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
-        long rss = get_rss_bytes(entry->pid);
+    spin_lock(&monitor_lock);
+    list_for_each_entry_safe(node, tmp, &monitored_list, list) {
+        rss = get_rss_bytes(node->pid);
+        
         if (rss < 0) {
             // Process exited
-            list_del(&entry->list);
-            kfree(entry);
+            list_del(&node->list);
+            kfree(node);
             continue;
         }
 
-        if (rss > entry->hard_limit_bytes) {
-            kill_process(entry->container_id, entry->pid, entry->hard_limit_bytes, rss);
-            list_del(&entry->list);
-            kfree(entry);
-        } else if (rss > entry->soft_limit_bytes && !entry->soft_limit_warned) {
-            log_soft_limit_event(entry->container_id, entry->pid, entry->soft_limit_bytes, rss);
-            entry->soft_limit_warned = true;
+        if (rss > node->hard_limit_bytes) {
+            kill_process(node->container_id, node->pid, node->hard_limit_bytes, rss);
+            list_del(&node->list);
+            kfree(node);
+            continue;
+        }
+
+        if (rss > node->soft_limit_bytes && !node->soft_warned) {
+            log_soft_limit_event(node->container_id, node->pid, node->soft_limit_bytes, rss);
+            node->soft_warned = true;
         }
     }
-    spin_unlock_irqrestore(&monitored_list_lock, flags);
+    spin_unlock(&monitor_lock);
 
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
@@ -161,8 +166,6 @@ static void timer_callback(struct timer_list *t)
 static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
     struct monitor_request req;
-    struct monitored_entry *entry, *tmp;
-    unsigned long flags;
 
     (void)f;
 
@@ -173,42 +176,53 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return -EFAULT;
 
     if (cmd == MONITOR_REGISTER) {
-        entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-        if (!entry) return -ENOMEM;
-
-        entry->pid = req.pid;
-        strncpy(entry->container_id, req.container_id, sizeof(entry->container_id) - 1);
-        entry->soft_limit_bytes = req.soft_limit_bytes;
-        entry->hard_limit_bytes = req.hard_limit_bytes;
-        entry->soft_limit_warned = false;
-
-        spin_lock_irqsave(&monitored_list_lock, flags);
-        list_add(&entry->list, &monitored_list);
-        spin_unlock_irqrestore(&monitored_list_lock, flags);
-
         printk(KERN_INFO
-               "[container_monitor] Registered container=%s pid=%d soft=%lu hard=%lu\n",
+               "[container_monitor] Registering container=%s pid=%d soft=%lu hard=%lu\n",
                req.container_id, req.pid, req.soft_limit_bytes, req.hard_limit_bytes);
+
+        struct monitored_node *new_node;
+
+        new_node = kmalloc(sizeof(*new_node), GFP_KERNEL);
+        if (!new_node)
+            return -ENOMEM;
+
+        new_node->pid = req.pid;
+        strncpy(new_node->container_id, req.container_id, MONITOR_NAME_LEN - 1);
+        new_node->container_id[MONITOR_NAME_LEN - 1] = '\0';
+        new_node->soft_limit_bytes = req.soft_limit_bytes;
+        new_node->hard_limit_bytes = req.hard_limit_bytes;
+        new_node->soft_warned = false;
+        INIT_LIST_HEAD(&new_node->list);
+
+        spin_lock(&monitor_lock);
+        list_add(&new_node->list, &monitored_list);
+        spin_unlock(&monitor_lock);
 
         return 0;
     }
 
-    if (cmd == MONITOR_UNREGISTER) {
-        spin_lock_irqsave(&monitored_list_lock, flags);
-        list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
-            if (entry->pid == req.pid) {
-                list_del(&entry->list);
-                kfree(entry);
-                spin_unlock_irqrestore(&monitored_list_lock, flags);
-                printk(KERN_INFO "[container_monitor] Unregistered container pid=%d\n", req.pid);
-                return 0;
-            }
-        }
-        spin_unlock_irqrestore(&monitored_list_lock, flags);
-        return -ENOENT;
-    }
+    printk(KERN_INFO
+           "[container_monitor] Unregister request container=%s pid=%d\n",
+           req.container_id, req.pid);
 
-    return -EINVAL;
+    struct monitored_node *node, *tmp;
+    int found = 0;
+
+    spin_lock(&monitor_lock);
+    list_for_each_entry_safe(node, tmp, &monitored_list, list) {
+        if (node->pid == req.pid) {
+            list_del(&node->list);
+            kfree(node);
+            found = 1;
+            break;
+        }
+    }
+    spin_unlock(&monitor_lock);
+
+    if (found)
+        return 0;
+
+    return -ENOENT;
 }
 
 /* --- Provided: file operations --- */
@@ -257,17 +271,16 @@ static int __init monitor_init(void)
 /* --- Provided: Module Exit --- */
 static void __exit monitor_exit(void)
 {
-    struct monitored_entry *entry, *tmp;
-    unsigned long flags;
-
     del_timer_sync(&monitor_timer);
 
-    spin_lock_irqsave(&monitored_list_lock, flags);
-    list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
-        list_del(&entry->list);
-        kfree(entry);
+    struct monitored_node *node, *tmp;
+
+    spin_lock(&monitor_lock);
+    list_for_each_entry_safe(node, tmp, &monitored_list, list) {
+        list_del(&node->list);
+        kfree(node);
     }
-    spin_unlock_irqrestore(&monitored_list_lock, flags);
+    spin_unlock(&monitor_lock);
 
     cdev_del(&c_dev);
     device_destroy(cl, dev_num);
